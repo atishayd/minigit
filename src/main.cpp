@@ -5,8 +5,53 @@
 #include <sstream>
 #include <iomanip>
 #include <fstream>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
+
+struct FileInfo {
+	uintmax_t size;
+	std::time_t modified;
+};
+
+std::time_t filetime_to_time_t(fs::file_time_type ft) {
+	using namespace std::chrono;
+
+	auto sctp = time_point_cast <system_clock::duration>(ft - fs::file_time_type::clock::now() + system_clock::now());
+	return system_clock::to_time_t(sctp);
+}
+
+std::unordered_map<std::string, FileInfo>
+load_previous_state(const fs::path& state_file) {
+	std::unordered_map<std::string, FileInfo> state;
+	
+	std::ifstream in(state_file);
+	if (!in) {
+		return state;
+	}
+
+	std::string line;
+	while (std::getline(in, line)) {
+		std::istringstream iss(line);
+		std::string path, size_str, time_str;
+
+		if (std::getline(iss, path, '|') && std::getline(iss, size_str, '|') && std::getline(iss, time_str)) {
+			FileInfo info;
+			info.size = std::stoull(size_str);
+			info.modified = static_cast<std::time_t>(std::stoll(time_str));
+			state[path] = info;
+		}
+	}
+	return state;
+}
+
+void save_state(const fs::path& state_file, const std::unordered_map<std::string, FileInfo>& state) {
+	std::ofstream out(state_file);
+	for (const auto& [path, info] : state) {
+		out << path << "|" << info.size << "|" << info.modified << "\n";
+	}
+}
+
 
 std::string timestamp_now() {
 	using clock = std::chrono::system_clock;
@@ -49,6 +94,16 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 
+	fs::path state_dir = target_root / ".backup_state";
+	fs::create_directories(state_dir);
+	fs::path state_file = state_dir / "last_state.txt";
+	
+	// load prev state
+	auto previous_state = load_previous_state(state_file);
+
+	// track new state
+	std::unordered_map<std::string, FileInfo> current_state;
+
 	fs::path backups_dir = target_root / "backups";
 	fs::create_directories(backups_dir,ec);
 	if (ec) {
@@ -64,9 +119,6 @@ int main(int argc, char* argv[]) {
 			<< " (" << ec.message() << ")\n";
 		return 1;
 	}
-
-	std::cout << "Backup directory created: " << backup_dir << "\n";
-	return 0;
 
 	// manifest log (what we copied)
 
@@ -108,32 +160,37 @@ int main(int argc, char* argv[]) {
 			}
 
 		} else if (entry.is_regular_file()) {
-			// ensure parent dir exists
-			fs::create_directories(dst_path.parent_path(), ec);
-			if (ec) {
-				++copy_errors;
-				manifest << "ERROR mkdir parent: " << dst_path.parent_path()
-					<< " (" <<  ec.message() << ")\n";
-				ec.clear();
-				continue;
+			fs::path rel = fs::relative(src_path, source);
+			std::string rel_str = rel.string();
+
+			uintmax_t size = entry.file_size();
+			auto ftime = entry.last_write_time();
+			std::time_t modified = filetime_to_time_t(ftime);
+
+			current_state[rel_str] = {size, modified};
+
+			auto it = previous_state.find(rel_str);
+			if (it != previous_state.end()) {
+				if (it->second.size == size && it->second.modified == modified) {
+					manifest << "SKIP (unchanged) " << rel_str << "\n";
+					continue;
+				}
 			}
 
+			fs::create_directories(dst_path.parent_path(), ec);
 			fs::copy_file(src_path, dst_path, fs::copy_options::overwrite_existing, ec);
+
 			if (ec) {
 				++copy_errors;
-				manifest << "ERROR copy: " << rel.string() << " (" << ec.message() << ")\n";
+				manifest << "ERROR copy: " << rel_str << " (" << ec.message() << ")\n";
 				ec.clear();
 			} else {
 				++files_copied;
-				manifest << "FILE " << rel.string() << "\n";
+				manifest << "FILE " << rel_str << "\n";
 			}
-		} else {
-			//  symlinks / sockets / etc. skipped
-			manifest << "SKIP " << rel.string() << "\n";
 		}
 	}
-
-	manifest << "\n--- SUmmary ---\n";
+	manifest << "\n--- Summary ---\n";
 	manifest << "dirs_created " << dirs_created << "\n";
 	manifest << "files_copied " << files_copied << "\n";
 	manifest << "errors: " << copy_errors << "\n";
@@ -144,9 +201,6 @@ int main(int argc, char* argv[]) {
 	std::cout << " files: " << files_copied << "\n";
 	std::cout << " errors: " << copy_errors << "\n";
 
+	save_state(state_file, current_state);
 	return (copy_errors ==0) ? 0 : 2;
-
-
-
-
 }
